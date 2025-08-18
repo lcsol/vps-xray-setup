@@ -1,4 +1,6 @@
 #!/bin/bash
+set -euo pipefail
+umask 077
 # =========================================================
 # 一键部署 Xray Reality + BBR 加速
 # 适用系统: Debian 11/12, Ubuntu 20.04/22.04
@@ -23,7 +25,7 @@ DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::="--force-confold" upgr
 
 # ======== 4. 安装依赖 ========
 echo ">>> 安装依赖..."
-apt install -y curl wget unzip qrencode socat net-tools iptables uuid-runtime
+apt install -y curl wget unzip qrencode socat net-tools iptables uuid-runtime jq
 
 # ======== 5. 配置防火墙 ========
 echo ">>> 配置防火墙..."
@@ -33,9 +35,8 @@ apt install -y ufw
 ufw delete allow ${XRAY_PORT}/tcp || true
 ufw delete allow ${XRAY_PORT}/udp || true
 
-# 放行当前 XRAY 端口
+# 放行当前 XRAY 端口（仅 TCP）
 ufw allow ${XRAY_PORT}/tcp
-ufw allow ${XRAY_PORT}/udp
 
 # SSH 默认允许全部
 ufw allow ssh
@@ -93,9 +94,23 @@ fi
 
 # ======== 7. 下载并安装最新稳定版 Xray ========
 echo ">>> 安装 Xray 最新稳定版..."
+
+# 根据架构选择正确的构建
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64|amd64)
+    XRAY_PKG="Xray-linux-64.zip";;
+  aarch64|arm64)
+    XRAY_PKG="Xray-linux-arm64-v8a.zip";;
+  armv7l|armv7)
+    XRAY_PKG="Xray-linux-arm32-v7a.zip";;
+  *)
+    echo "不支持的架构: $ARCH"; exit 1;;
+esac
+
 LATEST_XRAY=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep tag_name | cut -d '"' -f 4)
 mkdir -p /usr/local/xray
-wget -O /usr/local/xray/xray.zip https://github.com/XTLS/Xray-core/releases/download/${LATEST_XRAY}/Xray-linux-64.zip
+wget -O /usr/local/xray/xray.zip https://github.com/XTLS/Xray-core/releases/download/${LATEST_XRAY}/${XRAY_PKG}
 unzip -o /usr/local/xray/xray.zip -d /usr/local/xray
 chmod +x /usr/local/xray/xray
 
@@ -157,7 +172,15 @@ After=network.target
 [Service]
 ExecStart=/usr/local/xray/xray -config /usr/local/xray/config.json
 Restart=on-failure
+RestartSec=3
 User=root
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target

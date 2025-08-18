@@ -77,6 +77,7 @@ require_bin jq
 require_bin curl
 require_bin ufw
 require_bin openssl
+require_bin uuidgen
 
 [[ -x "$XRAY_BIN" ]] || { log "未找到 Xray 可执行文件：$XRAY_BIN"; exit 1; }
 [[ -f "$CONFIG_FILE" ]] || { log "未找到 Xray 配置：$CONFIG_FILE"; exit 1; }
@@ -86,6 +87,8 @@ mkdir -p "$BACKUP_DIR"
 log "读取当前配置..."
 OLD_PORT=$(jq -r '.inbounds[0].port' "$CONFIG_FILE")
 OLD_UUID=$(jq -r '.inbounds[0].settings.clients[0].id' "$CONFIG_FILE")
+OLD_SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$CONFIG_FILE")
+PRIVATE_KEY=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$CONFIG_FILE")
 
 # 生成新配置参数
 NEW_UUID=$(uuidgen)
@@ -106,45 +109,69 @@ BACKUP_FILE="$BACKUP_DIR/config_$(date '+%F_%H-%M-%S').json"
 cp "$CONFIG_FILE" "$BACKUP_FILE"
 log "已备份到：$BACKUP_FILE"
 
-# 修改配置
+# 修改配置（先写入临时文件）
 TMP_FILE=$(mktemp)
 jq \
   --argjson port "$NEW_PORT" \
   --arg uuid "$NEW_UUID" \
   --arg sid "$NEW_SHORT_ID" \
-  --arg fp "$NEW_FP" \
   --arg sni "$NEW_SNI" \
   '
   .inbounds[0].port = $port
   | .inbounds[0].settings.clients[0].id = $uuid
   | .inbounds[0].streamSettings.realitySettings.shortIds = [$sid]
   | .inbounds[0].streamSettings.realitySettings.serverNames = [$sni]
-  | .inbounds[0].streamSettings.fingerprint = $fp
+  | .inbounds[0].streamSettings.realitySettings.dest = ($sni + ":443")
   ' "$CONFIG_FILE" > "$TMP_FILE"
 
-mv "$TMP_FILE" "$CONFIG_FILE"
+# 测试新配置，不直接覆盖
+if "$XRAY_BIN" -test -config "$TMP_FILE" >/dev/null 2>&1; then
+  cp "$TMP_FILE" "$CONFIG_FILE"
+  log "配置语法校验通过"
+else
+  log "配置测试失败，保持原配置不变"
+  rm -f "$TMP_FILE"
+  exit 1
+fi
 
-# 更新防火墙
-ufw delete allow "$OLD_PORT" >/dev/null 2>&1 || true
-ufw allow "$NEW_PORT" >/dev/null 2>&1
-log "防火墙已更新：移除 $OLD_PORT，开放 $NEW_PORT"
+# 更新防火墙（仅 TCP）
+ufw delete allow "${OLD_PORT}/tcp" >/dev/null 2>&1 || true
+ufw allow "${NEW_PORT}/tcp" >/dev/null 2>&1
+log "防火墙已更新：移除 ${OLD_PORT}/tcp，开放 ${NEW_PORT}/tcp"
 
-# 测试并应用
-if "$XRAY_BIN" run -test -confdir /etc/xray >/dev/null 2>&1; then
-  systemctl restart xray
+# 重启服务
+systemctl restart xray
+sleep 1
+if systemctl is-active --quiet xray; then
   log "Xray 已重启成功"
 else
-  log "配置测试失败，开始回滚..."
+  log "Xray 重启失败，开始回滚..."
   cp "$BACKUP_FILE" "$CONFIG_FILE"
-  ufw delete allow "$NEW_PORT" >/dev/null 2>&1 || true
-  ufw allow "$OLD_PORT" >/dev/null 2>&1 || true
-  systemctl restart xray
+  ufw delete allow "${NEW_PORT}/tcp" >/dev/null 2>&1 || true
+  ufw allow "${OLD_PORT}/tcp" >/dev/null 2>&1 || true
+  systemctl restart xray || true
   log "已回滚到备份：$BACKUP_FILE"
   exit 1
 fi
 
+# 计算公钥（从私钥推导）
+PBK=$("$XRAY_BIN" x25519 -i "$PRIVATE_KEY" | awk '/Public key/ {print $3}')
+
+# 获取服务器 IP（多源回退）
+get_public_ip() {
+  for url in \
+    "https://api.ipify.org" \
+    "https://ifconfig.me" \
+    "https://ip.sb"; do
+    ip=$(curl -s "$url") || true
+    if [[ -n "${ip:-}" ]]; then echo "$ip"; return 0; fi
+  done
+  return 1
+}
+SERVER_IP=$(get_public_ip || echo "127.0.0.1")
+
 # 生成新的 Reality 链接
-LINK="vless://${NEW_UUID}@$(curl -s ifconfig.me):${NEW_PORT}?encryption=none&security=reality&pbk=填你的公钥&sid=${NEW_SHORT_ID}&fp=${NEW_FP}&sni=${NEW_SNI}&type=tcp&flow=xtls-rprx-vision-udp443#Reality"
+LINK="vless://${NEW_UUID}@${SERVER_IP}:${NEW_PORT}?encryption=none&security=reality&pbk=${PBK}&sid=${NEW_SHORT_ID}&fp=${NEW_FP}&sni=${NEW_SNI}&type=tcp&flow=xtls-rprx-vision#Reality"
 
 # 推送通知
 send_email "Xray 配置已更新" "新链接：$LINK"
