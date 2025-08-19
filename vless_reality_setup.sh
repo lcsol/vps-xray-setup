@@ -181,6 +181,15 @@ cat > /usr/local/xray/config.json <<EOF
 }
 EOF
 
+# Validate config before installing service
+echo ">>> Validating Xray config..."
+chmod 700 /usr/local/xray || true
+chmod 600 /usr/local/xray/config.json || true
+if ! /usr/local/xray/xray -test -config /usr/local/xray/config.json; then
+  echo "❌ Xray config validation failed."
+  exit 1
+fi
+
 # ======== 10. Configure systemd unit ========
 echo ">>> Configuring Xray systemd service..."
 cat > /etc/systemd/system/xray.service <<EOF
@@ -189,7 +198,7 @@ Description=Xray Service
 After=network.target
 
 [Service]
-ExecStart=/usr/local/xray/xray -config /usr/local/xray/config.json
+ExecStart=/usr/local/xray/xray run -config /usr/local/xray/config.json
 Restart=on-failure
 RestartSec=3
 User=root
