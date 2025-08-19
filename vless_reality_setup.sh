@@ -1,81 +1,96 @@
 #!/bin/bash
-set -euo pipefail
-umask 077
 # =========================================================
-# One-click deploy: Xray Reality + BBR
-# Supported OS: Debian 11/12, Ubuntu 20.04/22.04
+# 一键部署 Xray Reality + BBR/BBR2 + 网络优化（含安全与隐蔽性增强）
+# 适用系统: Debian 11/12, Ubuntu 20.04/22.04
 # =========================================================
 
-# ======== 1. Variables ========
-XRAY_PORT=$((RANDOM % 50000 + 10000))  # Reality listening port (TCP only)
-XRAY_DOMAIN="www.icloud.com"           # Decoy SNI/server name; pick a stable, high-reputation TLS origin
-SSH_ACCESS_MODE="any"                  # SSH access mode: any=allow all IPs, myip=allow only current public IP
+# ======== 0. DNS 优化 ========
+echo ">>> 配置 DNS ..."
+cat > /etc/resolv.conf <<EOF
+nameserver 1.1.1.1       # Cloudflare
+nameserver 8.8.8.8       # Google
+nameserver 9.9.9.9       # Quad9
+EOF
 
-# ======== 2. Require root ========
+# 锁定 resolv.conf 防止被 DHCP 覆盖（可选，解锁命令: chattr -i /etc/resolv.conf）
+chattr +i /etc/resolv.conf || true
+
+# 如果 systemd-resolved 存在，则配置并重启
+if [ -f /etc/systemd/resolved.conf ]; then
+    sed -i '/^#DNS=/c\DNS=1.1.1.1 8.8.8.8 9.9.9.9' /etc/systemd/resolved.conf
+    sed -i '/^#FallbackDNS=/c\FallbackDNS=1.0.0.1 8.8.4.4 149.112.112.112' /etc/systemd/resolved.conf
+    systemctl restart systemd-resolved || true
+fi
+
+systemd-resolve --flush-caches || true
+echo "✅ DNS 优化完成"
+
+# ======== 1. 配置变量 ========
+XRAY_PORT=$((RANDOM % 50000 + 10000))   # Reality 端口
+SSH_ACCESS_MODE="any"                   # SSH 访问模式: any=全部IP, myip=仅当前公网IP
+
+# SNI 候选池（直连可访问的 CDN / 大厂域名）
+SNI_POOL=("www.icloud.com" "www.apple.com" "www.microsoft.com" "www.bing.com" "www.speedtest.net")
+# TLS 指纹池
+FP_POOL=("chrome" "firefox" "safari" "ios" "android")
+
+rand_from_array() {
+  local -n arr=$1
+  echo "${arr[$RANDOM % ${#arr[@]}]}"
+}
+XRAY_DOMAIN=$(rand_from_array SNI_POOL)
+XRAY_FP=$(rand_from_array FP_POOL)
+
+# ======== 2. 检查 root 权限 ========
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Please run this script as root"
+  echo "请使用 root 权限运行此脚本"
   exit 1
 fi
 
-# ======== 3. Update system ========
-echo ">>> Updating system..."
+# ======== 3. 系统更新 & 依赖安装 ========
+echo ">>> 更新系统 & 安装依赖..."
 apt update
 DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::="--force-confold" upgrade -y
+apt install -y curl wget unzip qrencode socat net-tools iptables uuid-runtime ufw
 
-# ======== 4. Install dependencies ========
-echo ">>> Installing dependencies..."
-apt install -y curl wget unzip qrencode socat net-tools iptables uuid-runtime jq ufw
+# ======== 4. 配置防火墙 ========
+echo ">>> 配置防火墙..."
+# 删除旧规则（忽略错误）
+ufw delete allow ${XRAY_PORT} || true
 
-# ======== 5. Configure firewall ========
-echo ">>> Configuring firewall..."
+# 放行当前 XRAY 端口（TCP+UDP 一起）
+ufw allow ${XRAY_PORT}
 
-# Delete any previous rules for XRAY_PORT (ignore errors)
-ufw delete allow ${XRAY_PORT}/tcp || true
-ufw delete limit ${XRAY_PORT}/tcp || true
-ufw delete allow ${XRAY_PORT}/udp || true
-
-# Allow current XRAY port (TCP only, with rate limiting)
-ufw limit ${XRAY_PORT}/tcp
-
-# SSH (default allow all)
 ufw allow ssh
-
 if [ "$SSH_ACCESS_MODE" = "myip" ]; then
     MYIP=$(curl -s https://api.ipify.org)
     if [ -n "$MYIP" ]; then
-        echo "Restrict SSH to current IP: $MYIP"
+        echo "仅允许 $MYIP 访问 SSH"
         ufw delete allow ssh || true
         ufw allow from $MYIP to any port 22 proto tcp
-    else
-        echo "⚠️ Failed to get public IP, SSH restriction not applied"
     fi
 fi
-
-# Enable UFW (non-interactive)
 ufw --force enable
 
-echo "✅ Firewall configured"
-
-
-# ======== 6. Enable BBR congestion control ========
-echo "=== Checking kernel version ==="
+# ======== 5. 启用 BBR/BBR2 ========
+echo "=== 检查内核版本 ==="
 kernel_version=$(uname -r | awk -F '.' '{print $1"."$2}')
 major=$(echo "$kernel_version" | cut -d. -f1)
 minor=$(echo "$kernel_version" | cut -d. -f2)
 
 if (( major < 4 || (major == 4 && minor < 9) )); then
-    echo "⚠️ Kernel < 4.9, BBR unsupported. Please upgrade and re-run."
+    echo "⚠️ 内核版本低于 4.9，BBR 不受支持，请升级内核后再试。"
     exit 1
 fi
 
-# Pick bbr2 if supported
+# 判断是否支持 bbr2
 if (( major > 5 || (major == 5 && minor >= 9) )); then
     cc_algo="bbr2"
 else
     cc_algo="bbr"
 fi
 
-echo "=== Enabling $cc_algo ==="
+echo "=== 尝试启用 $cc_algo ==="
 cat <<EOF >/etc/sysctl.d/99-bbr.conf
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=$cc_algo
@@ -83,15 +98,17 @@ EOF
 
 sysctl --system > /dev/null
 
-# Verify congestion control
-current_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
+# 检查当前拥塞控制算法
+current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+
 if [[ "$current_cc" == "$cc_algo" ]]; then
-  echo "✅ $cc_algo enabled"
+  echo "✅ $cc_algo 加速已启用"
 else
-  echo "⚠️ $cc_algo not active, current: $current_cc"
+  echo "⚠️ $cc_algo 未生效，当前算法: $current_cc"
+  echo "👉 建议执行 reboot 后再检查：sysctl net.ipv4.tcp_congestion_control"
 fi
 
-# Additional TCP tuning for throughput/latency
+# ======== 5.1 网络优化 ========
 cat <<EOF >/etc/sysctl.d/99-net-optim.conf
 net.ipv4.tcp_fastopen=3
 net.core.rmem_max=67108864
@@ -102,43 +119,28 @@ net.core.somaxconn=4096
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_slow_start_after_idle=0
 net.ipv4.ip_local_port_range=10000 65000
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_tw_reuse=1
 EOF
+sysctl --system >/dev/null
 
-sysctl --system > /dev/null
-
-# ======== 7. Download and install latest Xray ========
-echo ">>> Installing latest Xray..."
-
-# Select build by architecture
-ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64|amd64)
-    XRAY_PKG="Xray-linux-64.zip";;
-  aarch64|arm64)
-    XRAY_PKG="Xray-linux-arm64-v8a.zip";;
-  armv7l|armv7)
-    XRAY_PKG="Xray-linux-arm32-v7a.zip";;
-  *)
-    echo "Unsupported architecture: $ARCH"; exit 1;;
-esac
-
+# ======== 6. 安装 Xray ========
+echo ">>> 安装 Xray..."
 LATEST_XRAY=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep tag_name | cut -d '"' -f 4)
 mkdir -p /usr/local/xray
-wget -O /usr/local/xray/xray.zip https://github.com/XTLS/Xray-core/releases/download/${LATEST_XRAY}/${XRAY_PKG}
+wget -O /usr/local/xray/xray.zip https://github.com/XTLS/Xray-core/releases/download/${LATEST_XRAY}/Xray-linux-64.zip
 unzip -o /usr/local/xray/xray.zip -d /usr/local/xray
+chmod 755 /usr/local/xray
 chmod +x /usr/local/xray/xray
 
-# ======== 8. Generate Reality keypair ========
-echo ">>> Generating UUID..."
+# ======== 7. 生成 Reality 密钥对 ========
 CLIENT_ID=$(uuidgen)
-echo ">>> Generating Reality keypair..."
 REALITY_KEYS=$(/usr/local/xray/xray x25519)
-PRIVATE_KEY=$(echo "$REALITY_KEYS" | grep Private | awk '{print $3}')
-PUBLIC_KEY=$(echo "$REALITY_KEYS" | grep Public | awk '{print $3}')
+PRIVATE_KEY=$(echo "$REALITY_KEYS" | grep Private | awk '{print $2}')
+PUBLIC_KEY=$(echo "$REALITY_KEYS" | grep Password | awk '{print $2}')
 SHORT_ID=$(openssl rand -hex 8)
 
-# ======== 9. Write Xray config ========
-echo ">>> Writing Xray config..."
+# ======== 8. 写入配置 ========
 cat > /usr/local/xray/config.json <<EOF
 {
   "inbounds": [
@@ -163,9 +165,7 @@ cat > /usr/local/xray/config.json <<EOF
           "reusePort": true
         },
         "realitySettings": {
-          "show": false,
           "dest": "${XRAY_DOMAIN}:443",
-          "xver": 0,
           "serverNames": ["${XRAY_DOMAIN}"],
           "privateKey": "${PRIVATE_KEY}",
           "shortIds": ["${SHORT_ID}"]
@@ -173,80 +173,58 @@ cat > /usr/local/xray/config.json <<EOF
       }
     }
   ],
-  "outbounds": [
-    {
-      "protocol": "freedom"
-    }
-  ]
+  "outbounds": [{ "protocol": "freedom" }]
 }
 EOF
 
-# Validate config before installing service
-echo ">>> Validating Xray config..."
-chmod 700 /usr/local/xray || true
-chmod 600 /usr/local/xray/config.json || true
-if ! /usr/local/xray/xray -test -config /usr/local/xray/config.json; then
-  echo "❌ Xray config validation failed."
-  exit 1
-fi
+chmod 600 /usr/local/xray/config.json
+/usr/local/xray/xray -test -config /usr/local/xray/config.json || { echo "配置校验失败"; exit 1; }
 
-# ======== 10. Configure systemd unit ========
-echo ">>> Configuring Xray systemd service..."
+# ======== 9. 配置 systemd ========
 cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service
 After=network.target
 
 [Service]
-ExecStart=/usr/local/xray/xray run -config /usr/local/xray/config.json
+ExecStart=/usr/local/xray/xray -config /usr/local/xray/config.json
 Restart=on-failure
-RestartSec=3
 User=root
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
-LimitNOFILE=1048576
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/usr/local/xray
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable xray
+systemctl enable --now xray
+
+echo "Restart Xray"
 systemctl restart xray
+ufw reload
 
-# ======== 11. Show connection info ========
+# ======== 10. 输出连接信息 ========
 SERVER_IP=$(curl -s https://api.ipify.org)
-#CLIENT_ID=$(jq -r '.inbounds[0].settings.clients[0].id' /usr/local/xray/config.json)
-
-VLESS_LINK="vless://${CLIENT_ID}@${SERVER_IP}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${XRAY_DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Xray-Reality"
+VLESS_LINK="vless://${CLIENT_ID}@${SERVER_IP}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${XRAY_DOMAIN}&fp=${XRAY_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Xray-Reality"
 
 echo "=================================================="
-echo "✅ Xray Reality installation complete"
-echo "Server IP: ${SERVER_IP}"
-echo "Port: ${XRAY_PORT}"
-echo "Domain (SNI): ${XRAY_DOMAIN}"
+echo "Server Parameters: "
+echo "服务器IP: ${SERVER_IP}"
+echo "端口: ${XRAY_PORT}"
+echo "域名(SNI): ${XRAY_DOMAIN}"
+echo "指纹(FP): ${XRAY_FP}"
 echo "Public Key: ${PUBLIC_KEY}"
 echo "Short ID: ${SHORT_ID}"
 echo "UUID: ${CLIENT_ID}"
-echo "VLESS link: ${VLESS_LINK}"
+echo "VLESS 链接: ${VLESS_LINK}"
 echo "=================================================="
-
-# Generate QR code
 echo "${VLESS_LINK}" | qrencode -t ANSIUTF8
 
-# ======== 12. Optional: disable root password login (commented by default) ========
-# echo ">>> Disabling root password login, key-based only..."
-# sed -i 's/^PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-# systemctl restart ssh
+sleep 1
 
-# ======== 13. Reboot to apply all settings ========
-if [ -f /var/run/reboot-required ] || [ "$(sysctl -n net.ipv4.tcp_congestion_control)" != "$cc_algo" ]; then
-  echo "Rebooting to apply kernel changes..."
-  reboot
-else
-  echo "No reboot needed."
-fi
+echo "✅ Xray Reality 部署完成"
+
